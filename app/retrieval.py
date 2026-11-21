@@ -17,7 +17,7 @@ import sqlite_vec
 from app.config import (
     EMBEDDING_DIMENSIONS, EMBEDDING_MAX_TOKENS, EMBEDDING_MODEL,
     RAG_DB, RAG_DOCUMENT_IDS, RAG_SOURCE, RAG_TOP_K, RAG_TREE, get_api_key,
-    RAG_GRAPH, GRAPH_START_K, GRAPH_HOPS, GRAPH_MAX_RESULTS,
+    RAG_GRAPH, GRAPH_START_K, GRAPH_HOPS, GRAPH_MAX_RESULTS, GRAPH_RERANK,
 )
 
 
@@ -124,12 +124,12 @@ def open_index(path: Path):
         db.close()
 
 
-def search(query: str) -> list[dict]:
+def search(query: str, vector: list[float] | None = None) -> list[dict]:
     """質問を埋め込み、近いページを最大RAG_TOP_K件返す。"""
     if not isinstance(query, str) or not query.strip():
         raise ValueError("検索語が空です。")
     with open_index(RAG_DB) as db:
-        vector = embed_text(query.strip(), "RETRIEVAL_QUERY")
+        vector = vector or embed_text(query.strip(), "RETRIEVAL_QUERY")
         rows = db.execute("""
             SELECT page_id, document_id, lecture, document_title, section, title, page, content,
                    vec_distance_cosine(embedding, ?) AS distance
@@ -151,7 +151,8 @@ def search_graph(query: str) -> dict:
             adjacent[a].add(b)
             adjacent[b].add(a)
 
-    seeds = [hit for hit in search(query) if hit["page_id"] in pages][:min(GRAPH_START_K, GRAPH_MAX_RESULTS)]
+    vector = embed_text(query.strip(), "RETRIEVAL_QUERY") if isinstance(query, str) and query.strip() else None
+    seeds = [hit for hit in search(query, vector) if hit["page_id"] in pages][:min(GRAPH_START_K, GRAPH_MAX_RESULTS)]
     seed_ids = {seed["page_id"] for seed in seeds}
     results, candidates = [], {}
     for rank, seed in enumerate(seeds):
@@ -181,9 +182,28 @@ def search_graph(query: str) -> dict:
                 if neighbor not in candidates or priority < candidates[neighbor][0]:
                     candidates[neighbor] = (priority, candidate)
     expanded = [candidate for _, candidate in sorted(candidates.values())]
+    if GRAPH_RERANK and expanded:
+        expanded = rerank_by_query(expanded, vector)
     return {"seeds": results, "expanded": expanded[:max(0, GRAPH_MAX_RESULTS - len(results))],
             "max_hops": GRAPH_HOPS}
 
+
+
+def rerank_by_query(candidates: list[dict], vector: list[float]) -> list[dict]:
+    """第5回 宿題（発展）: グラフで集めた候補を、質問ベクトルとの距離が近い順に並べ直す。
+
+    埋め込みは索引DBに保存済みのものを使うので、追加のAPI呼び出しはない。
+    """
+    ids = [candidate["page_id"] for candidate in candidates]
+    with open_index(RAG_DB) as db:
+        rows = db.execute(
+            f"SELECT page_id, vec_distance_cosine(embedding, ?) AS distance FROM chunks "
+            f"WHERE page_id IN ({','.join('?' * len(ids))})",
+            (sqlite_vec.serialize_float32(vector), *ids),
+        )
+        distances = {row["page_id"]: row["distance"] for row in rows}
+    reranked = [{**candidate, "distance": distances.get(candidate["page_id"], 2.0)} for candidate in candidates]
+    return sorted(reranked, key=lambda candidate: (candidate["distance"], candidate["hops"], candidate["page_id"]))
 
 
 def run_full_context(agent, question: str, model, instructions: str, prompt_template: str):
